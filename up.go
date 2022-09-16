@@ -177,6 +177,7 @@ func main() {
 	if *noinput {
 		stdin = bytes.NewReader(nil)
 	} else if isatty.IsTerminal(os.Stdin.Fd()) {
+		// TODO: Why is this a TODO?
 		// TODO: Without this block, we'd hang when nothing is piped on input (see
 		// github.com/peco/peco, mattn/gof, fzf, etc.)
 		die("up requires some data piped on standard input, for example try: `echo hello world | up`")
@@ -228,6 +229,7 @@ func main() {
 				commandSubprocess = nil
 				commandOutput.Buf = stdinCapture
 			}
+			commandOutput.Y = 0
 			restart = false
 			lastCommand = command
 		}
@@ -238,7 +240,8 @@ func main() {
 		if command == lastCommand {
 			style = whiteOnDBlue
 		}
-		stdinCapture.DrawStatus(TuiRegion(tui, 0, 0, 1, 1), style)
+		width, _ := tui.Size()
+		stdinCapture.DrawStatus(TuiRegion(tui, 0, 0, w-1, 1), commandOutput.Y + 1, width, style)
 		commandEditor.DrawTo(TuiRegion(tui, 1, 0, w-1, 1), style,
 			func(x, y int) { tui.ShowCursor(x+1, 0) })
 		commandOutput.DrawTo(TuiRegion(tui, 0, 1, w, h-1))
@@ -250,7 +253,7 @@ func main() {
 		// Key pressed
 		case *tcell.EventKey:
 			// Is it a command editor key?
-			if commandEditor.HandleKey(ev) {
+			if commandEditor.HandleKey(ev, &restart) {
 				message = ""
 				continue
 			}
@@ -262,11 +265,18 @@ func main() {
 			// Some other global key combinations
 			switch getKey(ev) {
 			case key(tcell.KeyEnter):
-				restart = true
+				tui.Fini()
+				reader := bufio.NewReader(commandOutput.Buf.NewReader(false))
+				for i := 0; i <= commandOutput.Y; i++ {
+					line, _ := reader.ReadString('\n')
+					if i == commandOutput.Y {
+						fmt.Printf("%s", line)
+					}
+				}
+				return
 			case key(tcell.KeyCtrlUnderscore),
 				ctrlKey(tcell.KeyCtrlUnderscore):
 				// TODO: ask for another character to trigger command-line option, like in `less`
-
 			case key(tcell.KeyCtrlS),
 				ctrlKey(tcell.KeyCtrlS):
 				stdinCapture.Pause(true)
@@ -383,10 +393,11 @@ func (e *Editor) DrawTo(region Region, style tcell.Style, setcursor func(x, y in
 	}
 }
 
-func (e *Editor) HandleKey(ev *tcell.EventKey) bool {
+func (e *Editor) HandleKey(ev *tcell.EventKey, restart *bool) bool {
 	// If a character is entered, with no modifiers except maybe shift, then just insert it
 	if ev.Key() == tcell.KeyRune && ev.Modifiers()&(^tcell.ModShift) == 0 {
 		e.insert(ev.Rune())
+		*restart = true
 		return true
 	}
 	// Handle editing & movement keys
@@ -394,8 +405,10 @@ func (e *Editor) HandleKey(ev *tcell.EventKey) bool {
 	case key(tcell.KeyBackspace), key(tcell.KeyBackspace2):
 		// See https://github.com/nsf/termbox-go/issues/145
 		e.delete(-1)
+		*restart = true
 	case key(tcell.KeyDelete):
 		e.delete(0)
+		*restart = true
 	case key(tcell.KeyLeft),
 		key(tcell.KeyCtrlB),
 		ctrlKey(tcell.KeyCtrlB):
@@ -417,12 +430,19 @@ func (e *Editor) HandleKey(ev *tcell.EventKey) bool {
 	case key(tcell.KeyCtrlK),
 		ctrlKey(tcell.KeyCtrlK):
 		e.kill()
+		*restart = true
 	case key(tcell.KeyCtrlY),
 		ctrlKey(tcell.KeyCtrlY):
 		e.insert(e.killspace...)
+		*restart = true
 	case key(tcell.KeyCtrlW),
 		ctrlKey(tcell.KeyCtrlW):
 		e.unixWordRubout()
+		*restart = true
+	case key(tcell.KeyCtrlU),
+		ctrlKey(tcell.KeyCtrlU):
+		e.unixClearBeforeCursor()
+		*restart = true
 	default:
 		// Unknown key/combination, not handled
 		return false
@@ -463,6 +483,19 @@ func (e *Editor) unixWordRubout() {
 	}
 	pos := e.cursor - 1
 	for pos != 0 && (unicode.IsSpace(e.value[pos]) || !unicode.IsSpace(e.value[pos-1])) {
+		pos--
+	}
+	e.killspace = append(e.killspace[:0], e.value[pos:e.cursor]...)
+	e.value = append(e.value[:pos], e.value[e.cursor:]...)
+	e.cursor = pos
+}
+
+func (e *Editor) unixClearBeforeCursor() {
+	if e.cursor <= 0 {
+		return
+	}
+	pos := e.cursor - 1
+	for pos != 0 {
 		pos--
 	}
 	e.killspace = append(e.killspace[:0], e.value[pos:e.cursor]...)
@@ -564,10 +597,12 @@ func (v *BufView) HandleKey(ev *tcell.EventKey, scrollY int) bool {
 	//
 	// Vertical scrolling
 	//
-	case key(tcell.KeyUp):
+	case key(tcell.KeyUp),
+		key(tcell.KeyBacktab):
 		v.Y--
 		v.normalizeY()
-	case key(tcell.KeyDown):
+	case key(tcell.KeyDown),
+		key(tcell.KeyTab):
 		v.Y++
 		v.normalizeY()
 	case key(tcell.KeyPgDn):
@@ -698,7 +733,7 @@ func (b *Buf) Pause(pause bool) {
 	b.mu.Unlock()
 }
 
-func (b *Buf) DrawStatus(region Region, style tcell.Style) {
+func (b *Buf) DrawStatus(region Region, curline int, tuiWidth int, style tcell.Style) {
 	status := '~' // default: still reading input
 
 	b.mu.Lock()
@@ -712,7 +747,16 @@ func (b *Buf) DrawStatus(region Region, style tcell.Style) {
 	}
 	b.mu.Unlock()
 
+	// Ahem. Why doesn't that count lines properly?
+	nlines := count(b.NewReader(false), '\n')
+	lineStatus := fmt.Sprintf("%3d/%3d", curline, nlines)
+
 	region.SetCell(0, 0, style, status)
+	for x, ch := range lineStatus {
+		_ = ch
+		_ = x
+		//region.SetCell(tuiWidth - len(lineStatus) + x, 0, style, ch)
+	}
 }
 
 func (b *Buf) NewReader(blocking bool) io.Reader {
